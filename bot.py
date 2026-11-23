@@ -236,7 +236,8 @@ async def show_products(chat_id, context, edit_msg=None, uid=0):
 
 async def show_product(chat_id, context, key, edit_msg=None):
     name, text = T.PRODUCTS[key]
-    markup = kb([[(T.BTN_WRITE_ME, f"write:{key}")], [(T.BTN_BACK, "products"), (T.BTN_HOME, "home")]])
+    first = T.PRODUCT_LINKS.get(key) or (T.BTN_WRITE_ME, f"write:{key}")
+    markup = kb([[first], [(T.BTN_BACK, "products"), (T.BTN_HOME, "home")]])
     media = T.PRODUCT_PHOTOS.get(key)
     if edit_msg and edit_msg.text and not media_path(media):
         try:
