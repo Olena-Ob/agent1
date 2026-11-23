@@ -366,6 +366,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, chat_id = u.id, msg.chat_id
     db.touch_user(uid, u.full_name, u.username or "")
     text = msg.text or ""
+    text = T.OLD_BUTTONS.get(text, text)  # старі назви кнопок теж працюють
 
     # 1) Кнопки нижнього меню завжди першими: людина не «застрягає» в питанні чи розсилці
     if text in menu_buttons():
