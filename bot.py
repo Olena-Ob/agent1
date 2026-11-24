@@ -218,7 +218,10 @@ async def send_gift(bot, chat_id, uid):
     fid_key = f"fid:{T.GIFT_FILE}:{int(os.path.getmtime(path))}"
     fid = db.kv(fid_key)
     try:
-        m = await bot.send_document(chat_id, fid or open(path, "rb"), caption=T.GIFT_TEXT, parse_mode=HTML)
+        markup = kb([[(T.BTN_GIFT_NEXT, f"prod:{T.GIFT_NEXT_PRODUCT}")], [(T.BTN_HOME, "home")]]) \
+            if T.GIFT_NEXT_PRODUCT in T.PRODUCTS else None
+        m = await bot.send_document(chat_id, fid or open(path, "rb"), caption=T.GIFT_TEXT, parse_mode=HTML,
+                                    reply_markup=markup)
         if not fid and m.document:
             db.kv(fid_key, m.document.file_id)
         db.log_ev(uid, "gift")
@@ -543,6 +546,53 @@ async def report_job(context):
     await notify_admins(context.bot, report_text(now))
 
 
+# ================== /dzherela: звідки приходять люди ==================
+
+def sources_text(now=None):
+    """Скільки різних людей прийшло за кожним посиланням ?start=...: сьогодні (за Києвом), 7 днів, весь час."""
+    now = now or datetime.now(config.TZ)
+    today = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    week = int(now.timestamp()) - 7 * 86400
+    with db.conn() as c:
+        rows = c.execute("SELECT user_id, extra, at FROM events WHERE ev='start' AND extra!=''").fetchall()
+    admins = set(config.ADMIN_IDS)
+    per = {}  # мітка → [сьогодні, 7 днів, весь час] (множини людей)
+    for uid, extra, at in rows:
+        if uid in admins:
+            continue
+        sets = per.setdefault(extra, (set(), set(), set()))
+        sets[2].add(uid)
+        if at >= week:
+            sets[1].add(uid)
+        if at >= today:
+            sets[0].add(uid)
+    if not per:
+        return T.SRC_TITLE + "\n\n" + T.SRC_NONE
+    groups = {}
+    for label, sets in per.items():
+        g = label.split("_")[0]
+        groups.setdefault(g if g in T.SRC_GROUPS else "", []).append((label, sets))
+
+    def nums(sets_list):
+        return " / ".join(str(len(set().union(*(s[i] for s in sets_list)))) for i in range(3))
+
+    parts = [T.SRC_TITLE]
+    for g in list(T.SRC_GROUPS) + [""]:
+        if g not in groups:
+            continue
+        items = sorted(groups[g], key=lambda x: -len(x[1][2]))
+        lines = [f"<b>{T.SRC_GROUPS.get(g, T.SRC_OTHER)}:</b> {nums([s for _, s in items])}"]
+        lines += [f"• {esc(label)}: {nums([sets])}" for label, sets in items[:15]]
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+async def dzherela(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not config.is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(sources_text(), parse_mode=HTML)
+
+
 # ================== помилки, запуск ==================
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -566,6 +616,7 @@ async def post_init(app: Application):
     for a in config.ADMIN_IDS:
         try:
             await app.bot.set_my_commands([BotCommand("start", "Почати"), BotCommand("menu", "Меню"),
+                                           BotCommand("dzherela", "Звідки приходять люди"),
                                            BotCommand("myid", "Мій Telegram ID")], scope=BotCommandScopeChat(a))
         except Exception as e:
             log.warning("admin commands %s: %s", a, e)
@@ -582,6 +633,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("dzherela", dzherela))
     app.add_handler(CallbackQueryHandler(on_callback))
     if launch:
         launch.add_handlers(app)  # /grupa і задачі продажів за розкладом
