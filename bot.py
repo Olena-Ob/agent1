@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from telegram import (BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup,
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
-from telegram.error import Forbidden
+from telegram.error import Conflict, Forbidden, NetworkError
 from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -518,6 +518,9 @@ async def report_job(context):
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("error", exc_info=context.error)
+    # Тимчасові збої (обрив зв'язку, дві копії під час оновлення): агент сам відновлюється, власницю не турбуємо
+    if isinstance(context.error, (Conflict, NetworkError)) and not isinstance(update, Update):
+        return
     try:
         if isinstance(update, Update) and update.effective_chat and update.effective_chat.type == "private":
             await context.bot.send_message(update.effective_chat.id, T.ERROR_USER)
