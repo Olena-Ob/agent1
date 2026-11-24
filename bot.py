@@ -18,6 +18,7 @@ from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler,
 
 import config
 import db
+import kviz
 import texts as T
 
 # Додаток продажів: якщо в папці є launch.py, агент уміє запуски й оплату. Помилки в ньому не ховаємо.
@@ -40,13 +41,13 @@ def main_button():
 
 
 def menu_buttons():
-    b = [main_button(), T.BTN_MAIN, T.BTN_PRODUCTS, T.BTN_ASK, T.BTN_CABINET, T.BTN_CONTACTS, T.BTN_ADMIN]
+    b = [main_button(), T.BTN_MAIN, T.BTN_QUIZ, T.BTN_PRODUCTS, T.BTN_ASK, T.BTN_CABINET, T.BTN_CONTACTS, T.BTN_ADMIN]
     return set(b)
 
 
 def kb_bottom(uid):
     """Нижнє меню: широка головна кнопка зверху, далі по 2 в ряд. Власниці ще «Керування»."""
-    rows = [[main_button()], [T.BTN_PRODUCTS, T.BTN_ASK], [T.BTN_CABINET, T.BTN_CONTACTS]]
+    rows = [[main_button()], [T.BTN_QUIZ], [T.BTN_PRODUCTS, T.BTN_ASK], [T.BTN_CABINET, T.BTN_CONTACTS]]
     if config.is_admin(uid):
         rows.append([T.BTN_ADMIN])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
@@ -178,13 +179,15 @@ async def after_start(context, chat_id, uid, src, is_new):
     Мітка може мати хвіст «_звідки»: rid_direct → чек-лист, prak_stories → практика, seans_kanal1 → міні-сеанс."""
     word = src.split("_")[0]
     product = T.ENTRY_PRODUCTS.get(word) or (word if word in T.PRODUCTS else "")
-    came_for = word == T.ENTRY_PRACTICE or product  # прийшла по конкретне: чек-лист разом не шлемо, щоб не завалювати
+    came_for = word in (T.ENTRY_PRACTICE, "test") or product  # прийшла по конкретне: чек-лист разом не шлемо, щоб не завалювати
     if T.GIFT_FILE and (word in ("gift", T.ENTRY_GIFT) or (is_new and not came_for)):
         await send_gift(context.bot, chat_id, uid)
     if launch and await launch.on_start(context, chat_id, uid, src):
         pass  # продажі: картка запуску, воронка-магніт або тест за міткою
     elif word == T.ENTRY_PRACTICE:
         await send_practice(context.bot, chat_id, uid)
+    elif word == "test":
+        await quiz_intro(context.bot, chat_id)
     elif product:
         db.log_ev(uid, "product", product)
         await show_product(chat_id, context, product)
@@ -302,6 +305,61 @@ async def ask_start(chat_id, context, uid, topic=""):
                                    reply_markup=kb([[(T.BTN_CANCEL, "ask_cancel")]]))
 
 
+# ================== тест (квіз) ==================
+
+async def _show(bot, chat_id, text, markup, edit_msg=None):
+    """Питання тесту міняються в тому самому повідомленні, щоб чат не засмічувався."""
+    if edit_msg is not None and edit_msg.text:
+        try:
+            return await edit_msg.edit_text(text, parse_mode=HTML, reply_markup=markup)
+        except Exception:
+            pass
+    return await bot.send_message(chat_id, text, parse_mode=HTML, reply_markup=markup)
+
+
+async def quiz_intro(bot, chat_id, edit_msg=None):
+    await _show(bot, chat_id, *kviz.intro(), edit_msg)
+
+
+async def quiz_callback(context, q, uid, chat_id, data):
+    bot = context.bot
+    if data in ("qz:go", "qz:re"):
+        kviz.answers(uid, "")
+        db.log_ev(uid, "quiz_start")
+        await _show(bot, chat_id, *kviz.question(0), q.message)
+        return
+    if data == "qz:prak":
+        await send_practice(bot, chat_id, uid)
+        return
+    if data == "qz:prod" and T.QUIZ_PRODUCT in T.PRODUCTS:
+        db.log_ev(uid, "product", T.QUIZ_PRODUCT)
+        await show_product(chat_id, context, T.QUIZ_PRODUCT)
+        return
+    try:
+        n, i = (int(x) for x in data[3:].split(":"))
+    except ValueError:
+        return
+    ans = kviz.answers(uid)
+    if n != len(ans) or not 0 <= i < len(kviz.KEYS):  # старе повідомлення або подвійне натискання
+        return
+    ans += kviz.KEYS[i]
+    kviz.answers(uid, ans)
+    if len(ans) < len(T.QUIZ_QUESTIONS):
+        await _show(bot, chat_id, *kviz.question(len(ans)), q.message)
+        return
+    key = kviz.score(ans)
+    db.log_ev(uid, "quiz_done", key)
+    await _show(bot, chat_id, *kviz.result(key), q.message)
+    # власниця теж отримує, коли проходить сама: так видно, як це виглядає
+    await notify_admins(bot, T.ADMIN_QUIZ.format(who=who(q.from_user), title=esc(T.QUIZ_RESULTS[key][0])))
+
+
+async def test_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not config.is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(kviz.stats(set(config.ADMIN_IDS)), parse_mode=HTML)
+
+
 async def show_admin(chat_id, context, edit_msg=None):
     total, week, src = db.stats()
     sources = "\n".join(f"• {esc(s)}: {n}" for s, n in src) or "• поки нікого"
@@ -345,6 +403,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if launch and data.startswith("lc:"):
         await launch.on_callback(update, context, data)
+    elif data.startswith("qz:"):
+        await quiz_callback(context, q, uid, chat_id, data)
     elif data == "home":
         state(uid, "")
         await context.bot.send_message(chat_id, T.MENU_HINT, reply_markup=kb_bottom(uid))
@@ -402,6 +462,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if launch and text == T.BTN_LAUNCH:
             await launch.show_card(context.bot, chat_id, uid)
+        elif text == T.BTN_QUIZ:
+            await quiz_intro(context.bot, chat_id)
         elif text == T.BTN_MAIN:
             await show_about(chat_id, context, uid)
         elif text == T.BTN_PRODUCTS:
@@ -617,6 +679,7 @@ async def post_init(app: Application):
         try:
             await app.bot.set_my_commands([BotCommand("start", "Почати"), BotCommand("menu", "Меню"),
                                            BotCommand("dzherela", "Звідки приходять люди"),
+                                           BotCommand("test_stat", "Статистика тесту"),
                                            BotCommand("myid", "Мій Telegram ID")], scope=BotCommandScopeChat(a))
         except Exception as e:
             log.warning("admin commands %s: %s", a, e)
@@ -634,6 +697,7 @@ def main():
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("dzherela", dzherela))
+    app.add_handler(CommandHandler("test_stat", test_stat))
     app.add_handler(CallbackQueryHandler(on_callback))
     if launch:
         launch.add_handlers(app)  # /grupa і задачі продажів за розкладом
