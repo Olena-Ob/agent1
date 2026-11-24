@@ -174,18 +174,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def after_start(context, chat_id, uid, src, is_new):
-    """Що робити після старту (і після підписки на канал): подарунок новим і розділ за міткою ?start=..."""
-    if (is_new or src == "gift") and T.GIFT_FILE:
+    """Що робити після старту (і після підписки на канал): подарунок і розділ за міткою ?start=...
+    Мітка може мати хвіст «_звідки»: rid_direct → чек-лист, prak_stories → практика, seans_kanal1 → міні-сеанс."""
+    word = src.split("_")[0]
+    product = T.ENTRY_PRODUCTS.get(word) or (word if word in T.PRODUCTS else "")
+    came_for = word == T.ENTRY_PRACTICE or product  # прийшла по конкретне: чек-лист разом не шлемо, щоб не завалювати
+    if T.GIFT_FILE and (word in ("gift", T.ENTRY_GIFT) or (is_new and not came_for)):
         await send_gift(context.bot, chat_id, uid)
-    # Мітка ?start=... може одразу відкривати розділ: ?start=p1 → продукт p1, ?start=ask → питання, ?start=about
     if launch and await launch.on_start(context, chat_id, uid, src):
         pass  # продажі: картка запуску, воронка-магніт або тест за міткою
-    elif src in T.PRODUCTS:
-        await show_product(chat_id, context, src)
-    elif src == "ask":
+    elif word == T.ENTRY_PRACTICE:
+        await send_practice(context.bot, chat_id, uid)
+    elif product:
+        db.log_ev(uid, "product", product)
+        await show_product(chat_id, context, product)
+    elif word == "ask":
         await ask_start(chat_id, context, uid)
-    elif src == "about":
+    elif word == "about":
         await show_about(chat_id, context, uid)
+
+
+async def send_practice(bot, chat_id, uid):
+    path = media_path(T.PRACTICE_FILE)
+    if not path:
+        return
+    fid_key = f"fid:{T.PRACTICE_FILE}:{int(os.path.getmtime(path))}"
+    fid = db.kv(fid_key)
+    markup = kb([[(T.BTN_ASK, "write:practice")], [(T.BTN_HOME, "home")]])
+    try:
+        m = await bot.send_audio(chat_id, fid or open(path, "rb"), caption=T.PRACTICE_TEXT, parse_mode=HTML,
+                                 title=T.PRACTICE_TITLE, performer=T.OWNER_NAME, reply_markup=markup)
+        if not fid and m.audio:
+            db.kv(fid_key, m.audio.file_id)
+        db.log_ev(uid, "practice")
+    except Exception as e:
+        log.warning("practice: %s", e)
 
 
 async def send_gift(bot, chat_id, uid):
@@ -424,7 +447,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         head = T.ADMIN_QUESTION.format(who=who(u), uid=uid, text=esc(text or msg.caption or "(голосове чи файл нижче)"))
         if topic:
             title = launch.topic_title(topic) if launch else ""
-            title = title or T.PRODUCTS.get(topic, (topic,))[0]
+            title = title or T.PRODUCTS.get(topic, (T.TOPIC_NAMES.get(topic, topic),))[0]
             head = f"Тема: <b>{esc(title)}</b>\n" + head
         for a in config.ADMIN_IDS:
             try:
@@ -485,6 +508,10 @@ def report_text(day=None):
         evs = [dict(r) for r in c.execute("SELECT user_id, ev, extra FROM events WHERE at>=? AND at<?", (a, b)).fetchall()]
     admins = set(config.ADMIN_IDS)
     evs = [e for e in evs if e["user_id"] not in admins and e["user_id"]]
+    links = {}
+    for e in evs:
+        if e["ev"] == "start" and e["extra"]:
+            links.setdefault(e["extra"], set()).add(e["user_id"])
     src = Counter((r["src"] if r["src"] not in ("", "direct") else "напряму") for r in new)
     acts = {}
     for e in evs:
@@ -497,6 +524,8 @@ def report_text(day=None):
         date=(today - timedelta(days=1)).strftime("%d.%m"), active=len({e["user_id"] for e in evs}), new=len(new),
         questions=sum(1 for e in evs if e["ev"] == "question"),
         sources="\n".join(f"• {esc(k)}: {v}" for k, v in src.most_common(8)) or T.REPORT_NONE,
+        links="\n".join(f"• {esc(k)}: {len(v)}" for k, v in sorted(links.items(), key=lambda x: -len(x[1]))[:12])
+              or T.REPORT_NONE,
         acts="\n".join(f"• {esc(k)}: {len(v)}" for k, v in top) or T.REPORT_NONE)
     if launch:
         text += "\n\n" + launch.report_lines(a, b)
