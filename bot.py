@@ -13,8 +13,8 @@ from telegram import (BotCommand, BotCommandScopeChat, InlineKeyboardButton, Inl
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
 from telegram.error import Conflict, Forbidden, NetworkError
-from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler, ChatMemberHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
 
 import config
 import db
@@ -125,8 +125,9 @@ async def notify_admins(bot, text, **k):
 
 # ================== підписка на канал (за бажанням) ==================
 
-async def gate_ok(bot, chat_id, uid, src=None, is_new=False):
-    """True, якщо можна далі. Якщо канал не задано, людина вже підписана або агент не може перевірити, пропускаємо."""
+async def gate_ok(bot, chat_id, uid, what=None):
+    """True, якщо можна видати подарунок. Перевіряємо тільки перед чек-листом і практикою.
+    Якщо група не задана, людина вже в групі або агент не може перевірити, пропускаємо."""
     if not T.CHANNEL or config.is_admin(uid) or db.kv(f"gate:{uid}") == "1":
         return True
     try:
@@ -140,15 +141,47 @@ async def gate_ok(bot, chat_id, uid, src=None, is_new=False):
         day = datetime.now(config.TZ).strftime("%Y-%m-%d")
         if db.kv("gate_warn") != day:  # власниці раз на добу
             db.kv("gate_warn", day)
-            await notify_admins(bot, T.ADMIN_GATE_WARN.format(channel=esc(T.CHANNEL)))
+            await notify_admins(bot, T.ADMIN_GATE_WARN.format(channel=esc(T.CHANNEL_NAME)))
         return True
-    if src is not None:  # запам'ятати, куди людина йшла, щоб продовжити після підписки
-        db.kv(f"gate_src:{uid}", src)
-        db.kv(f"gate_new:{uid}", "1" if is_new else "")
-    url = "https://t.me/" + T.CHANNEL.lstrip("@")
+    if what:  # запам'ятати, який подарунок людина хотіла, щоб видати його після підписки
+        db.kv(f"gate_src:{uid}", what)
+    url = T.CHANNEL_LINK or "https://t.me/" + str(T.CHANNEL).lstrip("@")
     await bot.send_message(chat_id, T.GATE, parse_mode=HTML,
                            reply_markup=kb([[(T.BTN_GATE_SUB, url)], [(T.BTN_GATE_CHECK, "gate")]]))
     return False
+
+
+async def give(bot, chat_id, uid, what):
+    """Видати подарунок (gift = чек-лист, practice = практика) після перевірки підписки, потім запросити в канал з медитаціями."""
+    if not await gate_ok(bot, chat_id, uid, what):
+        return
+    if what == "practice":
+        await send_practice(bot, chat_id, uid)
+    else:
+        await send_gift(bot, chat_id, uid)
+    await send_medit_invite(bot, chat_id, uid)
+
+
+async def send_medit_invite(bot, chat_id, uid):
+    """Запрошення в канал з практиками й медитаціями: кожній людині один раз."""
+    if not T.MEDIT_LINK or db.kv(f"medit:{uid}") == "1":
+        return
+    db.kv(f"medit:{uid}", "1")
+    try:
+        await bot.send_message(chat_id, T.MEDIT_INVITE, parse_mode=HTML,
+                               reply_markup=kb([[(T.BTN_MEDIT, T.MEDIT_LINK)]]))
+        db.log_ev(uid, "medit_inv")
+    except Exception as e:
+        log.warning("medit invite: %s", e)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Агента зробили адміністратором групи чи каналу: пишемо власниці номер, щоб вписати його в CHANNEL."""
+    upd = update.my_chat_member
+    if not upd or upd.chat.type == "private":
+        return
+    if upd.new_chat_member.status == "administrator" and upd.old_chat_member.status != "administrator":
+        await notify_admins(context.bot, T.ADMIN_CHAT_ADDED.format(title=esc(upd.chat.title or ""), id=upd.chat.id))
 
 
 # ================== старт і меню ==================
@@ -169,8 +202,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(T.WELCOME_BACK.format(name=esc(u.first_name)), parse_mode=HTML,
                                         reply_markup=kb_bottom(u.id))
-    if not await gate_ok(context.bot, chat_id, u.id, src, is_new):
-        return
     await after_start(context, chat_id, u.id, src, is_new)
 
 
@@ -181,11 +212,11 @@ async def after_start(context, chat_id, uid, src, is_new):
     product = T.ENTRY_PRODUCTS.get(word) or (word if word in T.PRODUCTS else "")
     came_for = word in (T.ENTRY_PRACTICE, "test") or product  # прийшла по конкретне: чек-лист разом не шлемо, щоб не завалювати
     if T.GIFT_FILE and (word in ("gift", T.ENTRY_GIFT) or (is_new and not came_for)):
-        await send_gift(context.bot, chat_id, uid)
+        await give(context.bot, chat_id, uid, "gift")
     if launch and await launch.on_start(context, chat_id, uid, src):
         pass  # продажі: картка запуску, воронка-магніт або тест за міткою
     elif word == T.ENTRY_PRACTICE:
-        await send_practice(context.bot, chat_id, uid)
+        await give(context.bot, chat_id, uid, "practice")
     elif word == "test":
         await quiz_intro(context.bot, chat_id)
     elif product:
@@ -329,7 +360,7 @@ async def quiz_callback(context, q, uid, chat_id, data):
         await _show(bot, chat_id, *kviz.question(0), q.message)
         return
     if data == "qz:prak":
-        await send_practice(bot, chat_id, uid)
+        await give(bot, chat_id, uid, "practice")
         return
     if data == "qz:prod" and T.QUIZ_PRODUCT in T.PRODUCTS:
         db.log_ev(uid, "product", T.QUIZ_PRODUCT)
@@ -390,16 +421,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if T.CHANNEL and not config.is_admin(uid):
             db.kv(f"gate:{uid}", "")
         if await gate_ok(context.bot, chat_id, uid):
-            await context.bot.send_message(chat_id, T.GATE_OK, reply_markup=kb_bottom(uid))
-            src = db.kv(f"gate_src:{uid}") or ""
-            fresh = db.kv(f"gate_new:{uid}") == "1"
+            what = db.kv(f"gate_src:{uid}") or "gift"
             db.kv(f"gate_src:{uid}", "")
-            db.kv(f"gate_new:{uid}", "")
-            await after_start(context, chat_id, uid, src, fresh)
+            await context.bot.send_message(chat_id, T.GATE_OK, reply_markup=kb_bottom(uid))
+            await give(context.bot, chat_id, uid, "practice" if what == "practice" else "gift")
         else:
             await context.bot.send_message(chat_id, T.GATE_NOT_YET)
-        return
-    if not config.is_admin(uid) and not await gate_ok(context.bot, chat_id, uid):
         return
     if launch and data.startswith("lc:"):
         await launch.on_callback(update, context, data)
@@ -458,8 +485,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Кнопки нижнього меню завжди першими: людина не «застрягає» в питанні чи розсилці
     if text in menu_buttons():
         state(uid, "")
-        if not await gate_ok(context.bot, chat_id, uid):
-            return
         if launch and text == T.BTN_LAUNCH:
             await launch.show_card(context.bot, chat_id, uid)
         elif text == T.BTN_QUIZ:
@@ -699,6 +724,7 @@ def main():
     app.add_handler(CommandHandler("dzherela", dzherela))
     app.add_handler(CommandHandler("test_stat", test_stat))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     if launch:
         launch.add_handlers(app)  # /grupa і задачі продажів за розкладом
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
